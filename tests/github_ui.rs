@@ -32,6 +32,8 @@ struct FakeGitHub {
     large: AtomicBool,
     list_calls: AtomicUsize,
     with_comments: AtomicBool,
+    resolved: AtomicBool,
+    resolution_unknown: AtomicBool,
     post_fail: AtomicBool,
     posts: Mutex<Vec<(u64, CommentTarget, String)>>,
     published: Mutex<Vec<(u64, ReviewComment)>>,
@@ -64,6 +66,11 @@ impl Backend for FakeGitHub {
                 line: Some(1),
                 side: CommentSide::Right,
                 in_reply_to: None,
+                resolved: if self.resolution_unknown.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    Some(self.resolved.load(Ordering::Relaxed))
+                },
             },
             ReviewComment {
                 id: 101,
@@ -73,6 +80,11 @@ impl Backend for FakeGitHub {
                 line: Some(1),
                 side: CommentSide::Right,
                 in_reply_to: Some(100),
+                resolved: if self.resolution_unknown.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    Some(self.resolved.load(Ordering::Relaxed))
+                },
             },
             ReviewComment {
                 id: 102,
@@ -82,6 +94,7 @@ impl Backend for FakeGitHub {
                 line: None,
                 side: CommentSide::Left,
                 in_reply_to: None,
+                resolved: Some(true),
             },
         ];
         comments.extend(
@@ -121,6 +134,7 @@ impl Backend for FakeGitHub {
             } else {
                 None
             },
+            resolved: None,
         };
         self.published
             .lock()
@@ -774,6 +788,68 @@ fn main() {
         w.render_frame(cx);
         assert!(w.try_find("pr-thread-100").is_some());
         assert!(w.try_find("pr-comment-101").is_some());
+        assert_eq!(w.find("pr-thread-status-100").label(), Some("Open"));
+    })
+    .unwrap();
+    backend.resolved.store(true, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("reload-pr-comments", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(w.find("pr-thread-status-100").label(), Some("Resolved"));
+        assert!(
+            w.try_find("pr-comment-100").is_some(),
+            "Resolved comments remain readable"
+        );
+        assert!(
+            w.try_find("pr-comment-101").is_some(),
+            "Replies share their thread's resolution"
+        );
+        assert!(
+            w.try_find("pr-reply-100").is_some(),
+            "Resolved threads still allow replies"
+        );
+    })
+    .unwrap();
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("target/previews/diffy-github-resolved-thread.png")
+        .unwrap();
+    backend.resolution_unknown.store(true, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("reload-pr-comments", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            w.find("pr-thread-status-100").label(),
+            Some("Status unavailable")
+        );
+        assert!(w.try_find("pr-comment-100").is_some());
+    })
+    .unwrap();
+    backend.resolution_unknown.store(false, Ordering::Relaxed);
+    backend.resolved.store(false, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("reload-pr-comments", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            w.find("pr-thread-status-100").label(),
+            Some("Open"),
+            "Reload reflects reopened threads"
+        );
         assert!(backend.posts.lock().unwrap().is_empty());
         w.within(("diff-file", 0usize))
             .within(("new", 0usize))
@@ -846,6 +922,12 @@ fn main() {
         w.render_frame(cx);
         w.click("pr-comment-input-3", cx);
         w.input("Keep this failed draft", cx);
+        w.render_frame(cx);
+        w.scroll(
+            "diff-body",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
         w.render_frame(cx);
         w.click("pr-submit-comment-3", cx);
     })
@@ -953,6 +1035,11 @@ fn main() {
         assert!(
             w.try_find("pr-thread-102").is_some(),
             "Outdated comments remain readable at their file header"
+        );
+        assert_eq!(
+            w.find("pr-thread-status-102").label(),
+            Some("Resolved"),
+            "Outdated and resolved are independent states"
         );
     })
     .unwrap();

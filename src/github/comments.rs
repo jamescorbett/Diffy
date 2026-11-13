@@ -2,6 +2,7 @@ use super::{Repository, client, credential, error, runtime};
 use gpui_kit::component::diff::{DiffLineRange, DiffSide};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +72,8 @@ pub struct ReviewComment {
     pub line: Option<u32>,
     pub side: CommentSide,
     pub in_reply_to: Option<u64>,
+    /// Thread resolution from GraphQL; REST alone cannot determine this.
+    pub resolved: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +100,7 @@ impl From<WireComment> for ReviewComment {
             line: c.line,
             side: c.side.unwrap_or(CommentSide::Right),
             in_reply_to: c.in_reply_to_id,
+            resolved: None,
         }
     }
 }
@@ -106,7 +110,7 @@ pub(super) fn list(repo: &Repository, number: u64) -> Result<Vec<ReviewComment>,
     let _entered = runtime.enter();
     let client = client(credential()?)?;
     runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let mut comments = tokio::time::timeout(Duration::from_secs(30), async {
             let mut comments = Vec::new();
             let mut bytes = 0;
             for page in 1..=20u32 {
@@ -125,22 +129,134 @@ pub(super) fn list(repo: &Repository, number: u64) -> Result<Vec<ReviewComment>,
                     if bytes > 8 * 1024 * 1024 {
                         return Err(
                             "This PR has too many comments to display here. Open it in GitHub."
-                                .into(),
+                                .to_owned(),
                         );
                     }
-                    comments.push(comment.into());
+                    comments.push(ReviewComment::from(comment));
                 }
                 if result.next.is_none() {
                     return Ok(comments);
                 }
             }
-            Err("This PR has more than 2,000 comments. Open it in GitHub.".into())
+            Err("This PR has more than 2,000 comments. Open it in GitHub.".to_owned())
         })
         .await
         .map_err(|_| {
             "Loading comments timed out. Retry when your connection is available.".to_owned()
-        })?
+        })??;
+        // Keep published comments readable if GraphQL is unavailable or denied.
+        // Unknown is explicit in the UI, never silently treated as unresolved.
+        if !comments.is_empty()
+            && let Ok(Ok(resolutions)) = tokio::time::timeout(
+                Duration::from_secs(10),
+                thread_resolutions(&client, repo, number),
+            )
+            .await
+        {
+            apply_resolutions(&mut comments, &resolutions);
+        }
+        Ok(comments)
     })
+}
+
+const THREAD_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}"#;
+
+#[derive(Deserialize)]
+struct ThreadData {
+    repository: Option<ThreadRepository>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadRepository {
+    pull_request: Option<ThreadPull>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadPull {
+    review_threads: ThreadPage,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadPage {
+    nodes: Vec<WireThread>,
+    page_info: ThreadPageInfo,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireThread {
+    is_resolved: bool,
+    comments: ThreadRoots,
+}
+#[derive(Deserialize)]
+struct ThreadRoots {
+    nodes: Vec<ThreadRoot>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadRoot {
+    database_id: Option<u64>,
+}
+
+async fn thread_resolutions(
+    client: &octocrab::Octocrab,
+    repo: &Repository,
+    number: u64,
+) -> Result<HashMap<u64, bool>, String> {
+    let mut resolutions = HashMap::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let data: ThreadData = client.graphql(&json!({
+            "query": THREAD_QUERY,
+            "variables": {"owner": repo.owner, "name": repo.name, "number": number, "after": cursor}
+        })).await.map_err(error)?;
+        let page = data
+            .repository
+            .and_then(|r| r.pull_request)
+            .ok_or("GitHub couldn't provide thread status.")?
+            .review_threads;
+        for thread in page.nodes {
+            if let Some(id) = thread.comments.nodes.first().and_then(|c| c.database_id) {
+                resolutions.insert(id, thread.is_resolved);
+            }
+        }
+        if !page.page_info.has_next_page {
+            return Ok(resolutions);
+        }
+        let next = page
+            .page_info
+            .end_cursor
+            .filter(|c| !c.is_empty())
+            .ok_or("GitHub didn't provide the next thread page.")?;
+        if cursor.as_ref() == Some(&next) {
+            return Err("GitHub repeated a thread page.".into());
+        }
+        cursor = Some(next);
+    }
+    Err("This PR has more than 2,000 threads.".into())
+}
+
+fn apply_resolutions(comments: &mut [ReviewComment], resolutions: &HashMap<u64, bool>) {
+    for comment in comments {
+        comment.resolved = resolutions
+            .get(&comment.in_reply_to.unwrap_or(comment.id))
+            .copied();
+    }
 }
 
 fn payload(target: &CommentTarget, body: &str) -> Result<Value, String> {
@@ -246,5 +362,69 @@ mod tests {
         assert_eq!(c.author, "Deleted user");
         assert_eq!(c.line, None);
         assert_eq!(c.body, "old comment");
+        assert_eq!(c.resolved, None, "REST does not report resolution");
+    }
+    #[test]
+    fn resolution_is_shared_by_roots_and_replies_but_missing_metadata_stays_unknown() {
+        let mut comments: Vec<_> = [
+            (10, None),
+            (11, Some(10)),
+            (12, None),
+            (13, None),
+            (15, Some(14)),
+        ]
+        .into_iter()
+        .map(|(id, reply)| {
+            ReviewComment::from(
+                serde_json::from_value::<WireComment>(json!({
+                    "id":id,"user":null,"body":"feedback","path":"f.rs","line":null,
+                    "side":"RIGHT","in_reply_to_id":reply
+                }))
+                .unwrap(),
+            )
+        })
+        .collect();
+        apply_resolutions(
+            &mut comments,
+            &HashMap::from([(10, true), (12, false), (14, true)]),
+        );
+        assert_eq!(
+            comments.iter().map(|c| c.resolved).collect::<Vec<_>>(),
+            [Some(true), Some(true), Some(false), None, Some(true)]
+        );
+    }
+    #[test]
+    fn graphql_thread_pages_preserve_resolution_root_ids_and_cursor() {
+        let data: ThreadData =
+            serde_json::from_value(json!({"repository":{"pullRequest":{"reviewThreads":{
+                "nodes":[
+                    {"isResolved":true,"comments":{"nodes":[{"databaseId":123}]}},
+                    {"isResolved":false,"comments":{"nodes":[{"databaseId":456}]}},
+                    {"isResolved":true,"comments":{"nodes":[{"databaseId":null}]}}
+                ],
+                "pageInfo":{"hasNextPage":true,"endCursor":"next-thread-page"}
+            }}}}))
+            .unwrap();
+        let page = data
+            .repository
+            .unwrap()
+            .pull_request
+            .unwrap()
+            .review_threads;
+        assert!(page.nodes[0].is_resolved);
+        assert_eq!(page.nodes[0].comments.nodes[0].database_id, Some(123));
+        assert!(!page.nodes[1].is_resolved);
+        assert_eq!(page.nodes[2].comments.nodes[0].database_id, None);
+        assert!(page.page_info.has_next_page);
+        assert_eq!(
+            page.page_info.end_cursor.as_deref(),
+            Some("next-thread-page")
+        );
+        assert!(
+            serde_json::from_value::<ThreadData>(json!({"repository":null}))
+                .unwrap()
+                .repository
+                .is_none()
+        );
     }
 }

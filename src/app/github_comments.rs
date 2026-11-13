@@ -14,7 +14,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, SharedString, Styled as _, Subscription, Task, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, Window, div, px,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -87,6 +88,14 @@ fn threads(comments: &[ReviewComment]) -> BTreeMap<u64, Vec<&ReviewComment>> {
         group.sort_by_key(|c| c.id);
     }
     groups
+}
+
+fn thread_resolution(id: u64, comments: &[&ReviewComment]) -> Option<bool> {
+    comments
+        .iter()
+        .find(|c| c.id == id)
+        .or_else(|| comments.first())
+        .and_then(|c| c.resolved)
 }
 
 impl Diffy {
@@ -333,9 +342,15 @@ impl Diffy {
         // successful write or cancel its UI reconciliation halfway through.
         draft.task = Some(cx.spawn(async move |owner, cx| {
             let request = key.clone();
+            let request_target = target.clone();
             let result = cx
                 .background_spawn(async move {
-                    backend.post_comment(&request.repository, request.number, &target, &body)
+                    backend.post_comment(
+                        &request.repository,
+                        request.number,
+                        &request_target,
+                        &body,
+                    )
                 })
                 .await;
             let _ = owner.update(cx, |this, cx| {
@@ -343,7 +358,15 @@ impl Diffy {
                     return;
                 };
                 match result {
-                    Ok(comment) => {
+                    Ok(mut comment) => {
+                        comment.resolved = match &target {
+                            CommentTarget::Line(_) => Some(false),
+                            CommentTarget::Reply(root) => state
+                                .comments
+                                .iter()
+                                .find(|c| c.id == *root)
+                                .and_then(|c| c.resolved),
+                        };
                         state.just_posted.insert(comment.id);
                         state.comments.retain(|c| c.id != comment.id);
                         state.comments.push(comment);
@@ -455,6 +478,16 @@ impl Diffy {
         let Some(state) = self.github.comments.states.get(&key) else {
             return div().into_any_element();
         };
+        let groups = threads(&state.comments);
+        let resolved = groups
+            .iter()
+            .filter(|(id, comments)| thread_resolution(**id, comments) == Some(true))
+            .count();
+        let open = groups
+            .iter()
+            .filter(|(id, comments)| thread_resolution(**id, comments) == Some(false))
+            .count();
+        let unknown = groups.len() - resolved - open;
         h_flex()
             .id("pr-comment-status")
             .test_support()
@@ -467,8 +500,14 @@ impl Diffy {
                 "Loading inline comments…".to_owned()
             } else {
                 format!(
-                    "{} inline threads · Hover a diff line and click + to comment",
-                    threads(&state.comments).len()
+                    "{} open · {} resolved{} · Hover a diff line and click + to comment",
+                    open,
+                    resolved,
+                    if unknown > 0 {
+                        format!(" · {unknown} status unavailable")
+                    } else {
+                        String::new()
+                    }
                 )
             })
             .child(div().flex_1())
@@ -503,22 +542,71 @@ impl Diffy {
         let Some(comments) = groups.get(&id) else {
             return div().into_any_element();
         };
+        let resolution = thread_resolution(id, comments);
+        let resolved = resolution == Some(true);
+        let status = match resolution {
+            Some(true) => "Resolved",
+            Some(false) => "Open",
+            None => "Status unavailable",
+        };
         let key = key.clone();
         v_flex()
             .id(SharedString::from(format!("pr-thread-{id}")))
             .test_support()
+            .relative()
             .m_2()
             .p_3()
             .gap_2()
             .min_w_0()
             .rounded(px(6.))
             .border_1()
-            .border_color(cx.theme().secondary_hover)
-            .bg(cx.theme().secondary)
+            .border_color(if resolved {
+                cx.theme().success.opacity(0.4)
+            } else {
+                cx.theme().secondary_hover
+            })
+            .bg(if resolved {
+                cx.theme().muted
+            } else {
+                cx.theme().secondary
+            })
+            .when(resolved, |el| el.text_color(cx.theme().muted_foreground))
+            .child(
+                div()
+                    .id(SharedString::from(format!("pr-thread-status-{id}")))
+                    .test_support()
+                    .role(gpui_kit::Role::Status)
+                    .aria_label(status)
+                    .absolute()
+                    .top_2()
+                    .right_3()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(if resolved {
+                        cx.theme().success
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(
+                        h_flex().child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(4.))
+                                .bg(if resolved {
+                                    cx.theme().success.opacity(0.12)
+                                } else {
+                                    cx.theme().secondary_hover
+                                })
+                                .child(status),
+                        ),
+                    ),
+            )
             .when(unplaced, |el| {
                 el.child(
                     div()
                         .text_xs()
+                        .pr(px(140.))
                         .text_color(cx.theme().muted_foreground)
                         .child(format!(
                             "Outdated or outside the current diff · {}",
@@ -532,6 +620,7 @@ impl Diffy {
                     .pb_2()
                     .child(
                         div()
+                            .pr(px(140.))
                             .font_medium()
                             .text_size(px(12.))
                             .child(format!("@{}", comment.author)),
@@ -715,6 +804,7 @@ mod tests {
             line: Some(1),
             side: CommentSide::Right,
             in_reply_to: reply,
+            resolved: Some(false),
         }
     }
     #[test]
@@ -744,5 +834,28 @@ mod tests {
             state.comments.is_empty(),
             "Later server-side deletions should still be reflected"
         );
+    }
+    #[test]
+    fn thread_status_uses_the_root_and_refreshes_without_conflating_outdated() {
+        let mut root = comment(1, None);
+        root.line = None;
+        root.resolved = Some(true);
+        let reply = comment(2, Some(1));
+        let mut state = State::default();
+        state.install_comments(vec![root.clone(), reply.clone()]);
+        assert_eq!(
+            thread_resolution(1, &threads(&state.comments)[&1]),
+            Some(true)
+        );
+        root.resolved = None;
+        state.install_comments(vec![root.clone(), reply.clone()]);
+        assert_eq!(thread_resolution(1, &threads(&state.comments)[&1]), None);
+        root.resolved = Some(false);
+        state.install_comments(vec![root, reply.clone()]);
+        assert_eq!(
+            thread_resolution(1, &threads(&state.comments)[&1]),
+            Some(false)
+        );
+        assert_eq!(thread_resolution(1, &[&reply]), Some(false));
     }
 }
