@@ -31,7 +31,9 @@ use gpui_kit::rgb;
 use gpui_kit::{Action, AsKeystroke as _, KeyBinding, KeyContext, Pixels};
 use std::path::PathBuf;
 
+mod content_search;
 mod files;
+mod github_comments;
 mod github_review;
 mod import;
 mod notice;
@@ -64,6 +66,7 @@ gpui_kit::actions!(
         PreviousChange,
         FocusDiff,
         FocusFileSearch,
+        FindInFiles,
         CopyRelativePath,
         CopyAbsolutePath,
         RevealFile,
@@ -144,6 +147,7 @@ pub fn init(cx: &mut App) {
             gpui_kit::MenuItem::action("Reset Diff Font Size", ResetZoom),
             gpui_kit::MenuItem::Separator,
             gpui_kit::MenuItem::action("Toggle Line Wrapping", ToggleWrap),
+            gpui_kit::MenuItem::action("Find in Files…", FindInFiles),
             gpui_kit::MenuItem::Separator,
             gpui_kit::MenuItem::action("Previous Worktree", PreviousWorktree),
             gpui_kit::MenuItem::action("Next Worktree", NextWorktree),
@@ -175,6 +179,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-up", PreviousChange, Some("Diffy")),
         KeyBinding::new("secondary-enter", FocusDiff, Some("Diffy")),
         KeyBinding::new("secondary-f", FocusFileSearch, Some("Diffy")),
+        KeyBinding::new("secondary-shift-f", FindInFiles, Some("Diffy")),
         KeyBinding::new("secondary-shift-s", ToggleGroup, Some("Diffy")),
         KeyBinding::new("secondary-s", StageFile, Some("Diffy")),
         KeyBinding::new("secondary-q", Quit, Some("Diffy")),
@@ -393,6 +398,7 @@ impl Render for Diffy {
             .on_action(cx.listener(|this, _: &FocusFileSearch, w, cx| {
                 this.focus_file_search(w, cx)
             }))
+            .on_action(cx.listener(|this, _: &FindInFiles, w, cx| this.focus_content_search(w, cx)))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_updates(true, cx)))
             .on_action(cx.listener(|this, _: &InstallUpdate, _, cx| this.install_update(cx)))
             .on_action(cx.listener(|_, _: &Hide, _, cx| cx.hide()))

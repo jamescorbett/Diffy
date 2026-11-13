@@ -794,5 +794,6 @@ impl Diffy {
         self.projects
             .get(self.active)
             .is_some_and(|p| p.loading || p.refreshing || p.view().preview_loading)
+            || self.active_view().is_some_and(|v| v.content_search.busy())
     }
 }

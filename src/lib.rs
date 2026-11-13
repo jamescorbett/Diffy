@@ -9,6 +9,7 @@ mod keyboard;
 pub mod profiling;
 pub mod project_apps;
 pub mod repository;
+pub mod search;
 pub mod state;
 pub mod updates;
 mod watch;

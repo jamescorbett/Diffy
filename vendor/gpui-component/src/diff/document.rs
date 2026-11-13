@@ -540,6 +540,25 @@ impl DiffFile {
     pub fn is_binary(&self) -> bool {
         self.inner.binary
     }
+    /// Whether this patch supplies the given one-based source line. Review
+    /// clients can keep outdated comments out of unrelated line annotations.
+    pub fn contains_line(&self, side: DiffSide, line: usize) -> bool {
+        self.lines(side).binary_search_by_key(&line, |source| source.line_number).is_ok()
+    }
+    /// Supplied modified source, followed by removed/replaced original lines.
+    /// Unchanged context is returned once, with its modified source position.
+    pub fn search_lines(&self) -> impl Iterator<Item = (DiffSide, usize, &str)> {
+        let modified = self.lines(DiffSide::Modified).iter().map(|line| {
+            (DiffSide::Modified, line.line_number(), line.text().as_ref())
+        });
+        let removed = self.pairs().iter().filter(|pair| pair.is_changed())
+            .filter_map(|pair| pair.original())
+            .map(|ix| {
+                let line = &self.lines(DiffSide::Original)[ix];
+                (DiffSide::Original, line.line_number(), line.text().as_ref())
+            });
+        modified.chain(removed)
+    }
     pub fn additions(&self) -> usize {
         self.inner.additions
     }

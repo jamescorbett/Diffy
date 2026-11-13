@@ -346,6 +346,7 @@ impl Diffy {
                     .invalidate(root, paths);
             }
             for view in &mut p.views {
+                view.content_search.invalidate();
                 if view.selected.as_ref().is_some_and(|selected| {
                     paths.is_none_or(|paths| {
                         paths.iter().any(|path| {

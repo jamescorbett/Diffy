@@ -217,6 +217,11 @@ impl Diffy {
             item("Focus diff", Box::new(FocusDiff), !has_files),
             item("Find file", Box::new(FocusFileSearch), p.is_none()),
             item(
+                "Find text in files",
+                Box::new(super::FindInFiles),
+                p.is_none(),
+            ),
+            item(
                 "Copy relative path",
                 Box::new(super::CopyRelativePath),
                 !has_files,

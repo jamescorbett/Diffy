@@ -2,15 +2,21 @@
 mod fixture;
 use diffy::{
     app,
-    github::{Backend, Page, PullDiff, PullRequest, PullSnapshot, Remote, Repository},
+    github::{
+        Backend, CommentSide, CommentTarget, Page, PullDiff, PullRequest, PullSnapshot, Remote,
+        Repository, ReviewComment,
+    },
 };
 use gpui_kit::{
     AppContext as _, Bounds, HeadlessAppContext, ScrollDelta, WindowBounds, WindowOptions,
-    assets::Assets, point, px, size, test::TestWindowExt as _,
+    assets::Assets,
+    component::diff::{DiffLineRange, DiffSide},
+    point, px, size,
+    test::TestWindowExt as _,
 };
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -25,6 +31,10 @@ struct FakeGitHub {
     calls: AtomicUsize,
     large: AtomicBool,
     list_calls: AtomicUsize,
+    with_comments: AtomicBool,
+    post_fail: AtomicBool,
+    posts: Mutex<Vec<(u64, CommentTarget, String)>>,
+    published: Mutex<Vec<(u64, ReviewComment)>>,
 }
 fn pr(number: u64, revision: usize) -> PullRequest {
     PullRequest {
@@ -41,6 +51,83 @@ fn pr(number: u64, revision: usize) -> PullRequest {
     }
 }
 impl Backend for FakeGitHub {
+    fn comments(&self, _: &Repository, number: u64) -> Result<Vec<ReviewComment>, String> {
+        if !self.with_comments.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let mut comments = vec![
+            ReviewComment {
+                id: 100,
+                author: "reviewer".into(),
+                body: "Existing inline feedback".into(),
+                path: "extra-00.txt".into(),
+                line: Some(1),
+                side: CommentSide::Right,
+                in_reply_to: None,
+            },
+            ReviewComment {
+                id: 101,
+                author: "author".into(),
+                body: "Existing reply".into(),
+                path: "extra-00.txt".into(),
+                line: Some(1),
+                side: CommentSide::Right,
+                in_reply_to: Some(100),
+            },
+            ReviewComment {
+                id: 102,
+                author: "reviewer".into(),
+                body: "Outdated feedback".into(),
+                path: "extra-01.txt".into(),
+                line: None,
+                side: CommentSide::Left,
+                in_reply_to: None,
+            },
+        ];
+        comments.extend(
+            self.published
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| *n == number)
+                .map(|(_, c)| c.clone()),
+        );
+        Ok(comments)
+    }
+    fn post_comment(
+        &self,
+        _: &Repository,
+        number: u64,
+        target: &CommentTarget,
+        body: &str,
+    ) -> Result<ReviewComment, String> {
+        self.posts
+            .lock()
+            .unwrap()
+            .push((number, target.clone(), body.into()));
+        std::thread::sleep(Duration::from_millis(30));
+        if self.post_fail.load(Ordering::Relaxed) {
+            return Err("Fixture posting denied; draft kept".into());
+        }
+        let comment = ReviewComment {
+            id: 1000 + self.posts.lock().unwrap().len() as u64,
+            author: "fixture".into(),
+            body: body.into(),
+            path: "extra-00.txt".into(),
+            line: Some(1),
+            side: CommentSide::Right,
+            in_reply_to: if let CommentTarget::Reply(id) = target {
+                Some(*id)
+            } else {
+                None
+            },
+        };
+        self.published
+            .lock()
+            .unwrap()
+            .push((number, comment.clone()));
+        Ok(comment)
+    }
     fn list(&self, repo: &Repository, page: u32) -> Result<Page, String> {
         self.list_calls.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(30));
@@ -132,6 +219,7 @@ fn main() {
     macro_rules! wait {
         () => {{
             for _ in 0..500 {
+                cx.advance_clock(Duration::from_millis(16));
                 cx.run_until_parked();
                 let done = cx
                     .update_window(handle, |_, w, cx| {
@@ -673,6 +761,343 @@ fn main() {
             "extra-00.txt"
         );
     });
+    assert_eq!(std::fs::read(repo.0.join(".git/index")).unwrap(), index);
+    // Read existing threads and write only after an explicit submit click.
+    backend.with_comments.store(true, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("reload-pr-comments", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("pr-thread-100").is_some());
+        assert!(w.try_find("pr-comment-101").is_some());
+        assert!(backend.posts.lock().unwrap().is_empty());
+        w.within(("diff-file", 0usize))
+            .within(("new", 0usize))
+            .hover(("line", 0usize), cx);
+        w.render_frame(cx);
+        w.within(("diff-file", 0usize))
+            .within(("new", 0usize))
+            .click(("add-annotation", 0usize), cx);
+        w.render_frame(cx);
+        assert!(w.try_find("pr-draft-1").is_some());
+        w.click("pr-comment-input-1", cx);
+        w.input("New inline feedback", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        backend.posts.lock().unwrap().is_empty(),
+        "Typing must never post a comment"
+    );
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("target/previews/diffy-github-comment-draft.png")
+        .unwrap();
+    cx.update_window(handle, |_, w, cx| {
+        w.click("pr-submit-comment-1", cx);
+        w.render_frame(cx);
+        w.click("pr-submit-comment-1", cx);
+    })
+    .unwrap();
+    wait!();
+    assert_eq!(
+        backend.posts.lock().unwrap().len(),
+        1,
+        "Repeated submit clicks cannot duplicate a write"
+    );
+    {
+        let posts = backend.posts.lock().unwrap();
+        assert_eq!(posts[0].0, 1);
+        assert_eq!(posts[0].2, "New inline feedback");
+        let CommentTarget::Line(anchor) = &posts[0].1 else {
+            panic!("Expected a line comment")
+        };
+        assert_eq!(
+            (anchor.path.as_str(), anchor.side, anchor.start, anchor.end),
+            ("extra-00.txt", CommentSide::Right, 1, 1)
+        );
+        assert_eq!(anchor.head_sha, "head-1-2");
+    }
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("pr-draft-1").is_none());
+        assert!(w.try_find("pr-comment-1001").is_some());
+        w.click("pr-reply-100", cx);
+        w.render_frame(cx);
+        w.click("pr-comment-input-2", cx);
+        w.input("A reply", cx);
+        w.render_frame(cx);
+        w.click("pr-submit-comment-2", cx);
+    })
+    .unwrap();
+    wait!();
+    assert_eq!(
+        backend.posts.lock().unwrap()[1].1,
+        CommentTarget::Reply(100)
+    );
+    backend.post_fail.store(true, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("pr-reply-100", cx);
+        w.render_frame(cx);
+        w.click("pr-comment-input-3", cx);
+        w.input("Keep this failed draft", cx);
+        w.render_frame(cx);
+        w.click("pr-submit-comment-3", cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find("pr-comment-error").is_some());
+        assert!(w.try_find("pr-draft-3").is_some());
+        assert_eq!(
+            view.read(cx).github_draft_body(3, cx).as_deref(),
+            Some("Keep this failed draft")
+        );
+        w.click("source-worktrees", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("pr-comment-status").is_none());
+        w.click("source-prs", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("pr-draft-3").is_some(),
+            "Leaving PR mode must retain failed drafts"
+        );
+        w.dispatch_action(Box::new(app::NextWorktree), cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(view.read(cx).github_selected(), Some(2));
+        assert!(
+            w.try_find("pr-draft-3").is_none(),
+            "Drafts must never leak into another PR"
+        );
+        w.dispatch_action(Box::new(app::PreviousWorktree), cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(view.read(cx).github_selected(), Some(1));
+        assert_eq!(
+            view.read(cx).github_draft_body(3, cx).as_deref(),
+            Some("Keep this failed draft")
+        );
+        w.scroll(
+            "diff-body",
+            ScrollDelta::Pixels(point(px(0.), px(-220.))),
+            cx,
+        );
+        w.render_frame(cx);
+        w.click("pr-cancel-comment-3", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("pr-draft-3").is_none());
+    })
+    .unwrap();
+    assert_eq!(
+        backend.posts.lock().unwrap().len(),
+        3,
+        "Navigation never retries a failed post"
+    );
+    cx.update_window(handle, |_, w, cx| {
+        w.click(("file-name", 0usize), cx);
+        view.update(cx, |v, cx| {
+            v.start_inline_comment(
+                &DiffLineRange::new("extra-00.txt", DiffSide::Original, 1, 1),
+                w,
+                cx,
+            )
+        });
+        w.render_frame(cx);
+        w.click("pr-comment-input-4", cx);
+        w.input("Keep this draft across a force push", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    backend.revision.store(3, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("refresh", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            view.read(cx).github_draft_body(4, cx).as_deref(),
+            Some("Keep this draft across a force push")
+        );
+        w.click("pr-submit-comment-4", cx);
+        w.render_frame(cx);
+        w.click("pr-cancel-comment-4", cx);
+        w.render_frame(cx);
+        w.click(("file-name", 1usize), cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("pr-thread-102").is_some(),
+            "Outdated comments remain readable at their file header"
+        );
+    })
+    .unwrap();
+    assert_eq!(
+        backend.posts.lock().unwrap().len(),
+        3,
+        "A changed head must block stale inline writes"
+    );
+    // Content search uses cached PR source, not filenames, local disk, or comments.
+    let calls = backend.calls.load(Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("find-in-files", cx);
+        w.render_frame(cx);
+        w.click("content-search-input", cx);
+        w.input("AFTER", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            view.read(cx).content_search_matches().len(),
+            41,
+            "status={:?}, files={}",
+            w.find("content-search-status").label(),
+            view.read(cx).github_document_paths(cx).len()
+        );
+    })
+    .unwrap();
+    cx.update_window(handle, |_, w, cx| {
+        w.click("content-search-case", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    assert!(cx.update(|cx| view.read(cx).content_search_matches().is_empty()));
+    cx.update_window(handle, |_, w, cx| {
+        w.click("content-search-case", cx);
+        w.click("content-search-input", cx);
+        w.press("secondary-a", cx);
+        w.input("PR 1 revision 3", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        assert_eq!(view.read(cx).content_search_matches().len(), 1);
+        w.click("content-search-result-0", cx);
+        w.render_frame(cx);
+        let position = view.read(cx).content_search_selected_line(cx).unwrap();
+        assert_eq!(
+            (position.path().as_str(), position.side(), position.line()),
+            ("src/review.rs", DiffSide::Modified, 1)
+        );
+        assert_eq!(
+            view.read(cx).selected_preview_path().unwrap().as_ref(),
+            "src/review.rs"
+        );
+    })
+    .unwrap();
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("target/previews/diffy-github-content-search.png")
+        .unwrap();
+    cx.update_window(handle, |_, w, cx| {
+        w.click("content-search-input", cx);
+        w.press("secondary-a", cx);
+        w.input("Existing inline feedback", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    assert!(
+        cx.update(|cx| view.read(cx).content_search_matches().is_empty()),
+        "Inline comment text is not file source"
+    );
+    cx.update_window(handle, |_, w, cx| {
+        w.click("back-to-file-names", cx);
+        w.render_frame(cx);
+        w.click("file-search", cx);
+        w.input("src", cx);
+        w.render_frame(cx);
+        w.click("find-in-files", cx);
+        w.render_frame(cx);
+        w.click("content-search-input", cx);
+        w.press("secondary-a", cx);
+        w.input("before", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update(|cx| {
+        let hits = view.read(cx).content_search_matches();
+        assert_eq!(
+            hits.len(),
+            41,
+            "Filename filtering must not restrict content search"
+        );
+        assert!(hits.iter().all(|h| h.position.side() == DiffSide::Original));
+    });
+    cx.update_window(handle, |_, w, cx| {
+        w.click("content-search-input", cx);
+        w.press("enter", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx)
+                .content_search_selected_line(cx)
+                .unwrap()
+                .side(),
+            DiffSide::Original
+        )
+    });
+    assert_eq!(
+        backend.calls.load(Ordering::Relaxed),
+        calls,
+        "Searching PR text must not make more diff requests"
+    );
+    cx.update_window(handle, |_, w, cx| {
+        w.dispatch_action(Box::new(app::NextWorktree), cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).content_search_matches().len(),
+            1,
+            "PR changes must discard the previous PR's matches"
+        )
+    });
+    cx.update_window(handle, |_, w, cx| {
+        w.dispatch_action(Box::new(app::PreviousWorktree), cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update(|cx| assert_eq!(view.read(cx).content_search_matches().len(), 41));
+    assert_eq!(
+        backend.posts.lock().unwrap().len(),
+        3,
+        "Searching and jumping must not publish comments"
+    );
     assert_eq!(std::fs::read(repo.0.join(".git/index")).unwrap(), index);
     println!(
         "GitHub PR header, search, pagination, read-only actions, local restoration, stale responses, and retry passed."

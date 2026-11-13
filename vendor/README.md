@@ -18,6 +18,11 @@ state, renderer, document, and menu modules:
 6. Add opt-in `PopupMenuItem::danger()` styling. Destructive labels retain the
    theme's danger color on hover and keyboard selection; disabled items remain
    muted. Diffy's project menu uses it for Remove Project.
+7. Expose `DiffFile::contains_line` so inline GitHub comments can be anchored to
+   supplied source lines; outdated or unavailable lines fall back to file headers.
+8. Expose a borrowed `DiffFile::search_lines` iterator over modified source and
+   removed/replaced original lines, without duplicating unchanged context or
+   copying whole source documents for content search.
 
 Differ selects this package with a Cargo patch. The native integration test in
 `tests/ui.rs` verifies wheel/keyboard scrolling to the last line of a 3,000-line

@@ -23,6 +23,7 @@ pub(super) struct Runtime {
     pub states: HashMap<PathBuf, State>,
     pub backend: Arc<dyn Backend>,
     snapshots: github::SnapshotCache,
+    pub comments: super::github_comments::Runtime,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -30,6 +31,7 @@ impl Default for Runtime {
             states: HashMap::new(),
             backend: Arc::new(github::OctocrabBackend),
             snapshots: github::SnapshotCache::default(),
+            comments: super::github_comments::Runtime::default(),
         }
     }
 }
@@ -421,6 +423,7 @@ impl Diffy {
                         this.github.snapshots.insert(root.clone(), result.snapshot);
                         s.cache_root = Some(root);
                         s.view.install_metadata(entries, number, cx);
+                        this.ensure_pr_comments(force, cx);
                         this.ensure_pr_preview(cx);
                     }
                     Err(error) => s.error = Some(error),
@@ -431,6 +434,7 @@ impl Diffy {
         cx.notify();
     }
     pub(super) fn ensure_pr_preview(&mut self, cx: &mut Context<Self>) {
+        self.ensure_pr_comments(false, cx);
         let Some(key) = self.github_key() else {
             return;
         };
@@ -722,6 +726,7 @@ impl Diffy {
     pub fn github_busy(&self) -> bool {
         self.pr_state()
             .is_some_and(|s| s.listing || s.loading || s.view.preview_loading)
+            || self.github_comments_busy()
     }
     pub fn github_document_paths(&self, cx: &gpui_kit::App) -> Vec<gpui_kit::SharedString> {
         self.pr_state()

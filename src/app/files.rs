@@ -147,6 +147,10 @@ impl Diffy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_github_repository(window, cx);
+        self.ensure_content_search(cx);
+        if self.active_view().is_some_and(|v| v.content_search.open) {
+            return self.render_content_search(cx);
+        }
         let Some(search) = self.ensure_file_search(window, cx) else {
             return div().size_full().bg(rgb(0)).into_any_element();
         };
@@ -195,6 +199,11 @@ impl Diffy {
                             .h_full()
                             .on_mouse_down(MouseButton::Left, |_, w, _| w.start_window_move())
                             .on_double_click(|_, w, _| w.titlebar_double_click()),
+                    )
+                    .child(
+                        Button::new("find-in-files").ghost().xsmall().icon(IconName::Search)
+                            .tooltip(super::shortcut_label(&super::FindInFiles, window, "Find text in files"))
+                            .on_click(cx.listener(|this, _, window, cx| this.focus_content_search(window, cx))),
                     ),
             )
             .child(
@@ -452,13 +461,18 @@ impl Diffy {
             return;
         }
         self.stop_file_repeat();
-        let Some(search) = self.active_view().and_then(|view| view.search.clone()) else {
+        if let Some(view) = self.active_view_mut() {
+            view.content_search.open = false;
+            view.content_search.suspend();
+        }
+        let Some(search) = self.ensure_file_search(window, cx) else {
             return;
         };
         search.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
         });
+        cx.notify();
     }
     pub(super) fn select_file(
         &mut self,

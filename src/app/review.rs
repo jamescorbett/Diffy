@@ -104,6 +104,7 @@ pub(super) struct ReviewView {
     pub(super) visible_files: Vec<usize>,
     pub(super) query: String,
     pub(super) search: Option<Entity<InputState>>,
+    pub(super) content_search: super::content_search::State,
     matcher: Matcher,
     match_buf: Vec<char>,
     pub(super) selected: Option<SharedString>,
@@ -137,6 +138,7 @@ impl ReviewView {
             visible_files: Vec::new(),
             query: String::new(),
             search: None,
+            content_search: Default::default(),
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             match_buf: Vec::new(),
             selected: None,
@@ -185,6 +187,7 @@ impl ReviewView {
         self.update_document_preview();
         self.preview_loading = false;
         self.preview_error = None;
+        self.reveal_search_target(cx);
     }
 
     fn update_document_preview(&mut self) {
@@ -219,6 +222,7 @@ impl ReviewView {
             .map(|p| &p.file)
     }
     pub(super) fn select(&mut self, path: SharedString, cx: &mut Context<Diffy>) {
+        self.content_search.pending = None;
         if !self.continuous && self.selected.as_ref() == Some(&path) {
             return;
         }
@@ -301,9 +305,11 @@ impl ReviewView {
         self.preview_revision = Some(revision);
         self.preview_loading = false;
         self.preview_error = None;
+        self.reveal_search_target(cx);
     }
 
     pub(super) fn suspend(&mut self, cx: &mut Context<Diffy>) {
+        self.content_search.suspend();
         self.preview_generation += 1;
         self.preview_task = None;
         self.preview_loading = false;
@@ -422,7 +428,11 @@ impl ReviewView {
     ) {
         let previous_selected = self.selected.clone();
         let previous_revision = self.selected_entry().map(|e| e.revision);
-        let document_changed = self.continuous && *self.files != files;
+        let content_changed = *self.files != files;
+        let document_changed = self.continuous && content_changed;
+        if content_changed {
+            self.content_search.invalidate();
+        }
         let ordinal = self
             .selected
             .as_ref()
@@ -470,6 +480,55 @@ impl ReviewView {
             self.preview_revision = None;
             self.preview_error = None;
         }
+    }
+
+    pub(super) fn search_documents(&self) -> Option<Vec<DiffFile>> {
+        if self.continuous {
+            (self.document_ready || self.files.is_empty())
+                .then(|| self.document.iter().map(|p| p.file.clone()).collect())
+        } else if !self.demos.is_empty() {
+            Some(
+                self.files
+                    .iter()
+                    .filter_map(|f| self.demos.get(f.path()).map(|p| p.file.clone()))
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn reveal_search_target(&mut self, cx: &mut Context<Diffy>) {
+        let Some(position) = self.content_search.pending.clone() else {
+            return;
+        };
+        if self
+            .selected_file()
+            .is_none_or(|f| f.path() != position.path())
+        {
+            return;
+        }
+        self.content_search.pending = None;
+        if self
+            .selected_file()
+            .is_none_or(|f| !f.contains_line(position.side(), position.line()))
+        {
+            self.content_search.error =
+                Some("This search result changed. Refresh and search again.".into());
+            return;
+        }
+        self.diff.update(cx, |diff, cx| {
+            diff.scroll_to_line(position.clone(), cx);
+            diff.set_selected_lines(
+                Some(gpui_kit::component::diff::DiffLineRange::new(
+                    position.path().clone(),
+                    position.side(),
+                    position.line(),
+                    position.line(),
+                )),
+                cx,
+            );
+        });
     }
 }
 

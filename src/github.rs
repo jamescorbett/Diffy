@@ -1,5 +1,7 @@
-//! Read-only GitHub API access. Credentials stay inside the backend, never in saved state.
+//! GitHub review access. Credentials stay inside the backend, never in saved state.
+mod comments;
 use crate::repository::{self, ChangedFile, Preview};
+pub use comments::{CommentAnchor, CommentSide, CommentTarget, ReviewComment};
 use gpui_kit::{SharedString, component::diff::DiffFile};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
@@ -281,6 +283,18 @@ impl SnapshotCache {
 pub trait Backend: Send + Sync {
     fn list(&self, repo: &Repository, page: u32) -> Result<Page, String>;
     fn diff(&self, repo: &Repository, number: u64) -> Result<PullDiff, String>;
+    fn comments(&self, _repo: &Repository, _number: u64) -> Result<Vec<ReviewComment>, String> {
+        Ok(Vec::new())
+    }
+    fn post_comment(
+        &self,
+        _repo: &Repository,
+        _number: u64,
+        _target: &CommentTarget,
+        _body: &str,
+    ) -> Result<ReviewComment, String> {
+        Err("Comment posting is unavailable for this backend.".into())
+    }
 }
 pub struct OctocrabBackend;
 fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
@@ -399,6 +413,18 @@ fn pull(pr: octocrab::models::pulls::PullRequest) -> PullRequest {
     }
 }
 impl Backend for OctocrabBackend {
+    fn comments(&self, repo: &Repository, number: u64) -> Result<Vec<ReviewComment>, String> {
+        comments::list(repo, number)
+    }
+    fn post_comment(
+        &self,
+        repo: &Repository,
+        number: u64,
+        target: &CommentTarget,
+        body: &str,
+    ) -> Result<ReviewComment, String> {
+        comments::post(repo, number, target, body)
+    }
     fn list(&self, repo: &Repository, page: u32) -> Result<Page, String> {
         let runtime = runtime()?;
         let _entered = runtime.enter();

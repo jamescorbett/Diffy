@@ -301,6 +301,7 @@ impl Diffy {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )
+            .children(remote.then(|| self.render_pr_comment_status(cx)))
             .children((!remote).then(|| {
                 h_flex()
                     .id("preview-header")
@@ -568,6 +569,7 @@ impl Diffy {
                                         })
                                 })
                             })
+                            .when(remote, |diff| self.with_pr_comments(diff, cx))
                             .soft_wrap(self.reader.wrap)
                             .split_ratio(0.4)
                             .hunk_separator(DiffHunkSeparator::Simple),
