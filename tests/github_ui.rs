@@ -204,6 +204,10 @@ fn main() {
         assert!(w.try_find("preview-header").is_none());
         assert!(w.try_find("pr-file-header:src/review.rs").is_some());
         assert!(w.try_find("pr-file-header:z.txt").is_some());
+        assert!(
+            w.find("pr-file-header:src/review.rs").bounds().size.height >= px(32.),
+            "File separators should have a distinct padded header band"
+        );
         assert_eq!(view.read(cx).github_document_paths(cx).len(), 2);
         let parses = view.read(cx).preview_request_count();
         w.click(("file-name", 1usize), cx);

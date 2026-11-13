@@ -14,10 +14,12 @@ use gpui_kit::Window;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Disableable as _;
+use gpui_kit::component::Icon;
 use gpui_kit::component::IconName;
 use gpui_kit::component::InteractiveElementExt as _;
 use gpui_kit::component::Selectable as _;
 use gpui_kit::component::Sizable as _;
+use gpui_kit::component::StyledExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::diff::Diff;
@@ -524,15 +526,40 @@ impl Diffy {
                                         .test_support()
                                         .w_full()
                                         .min_w_0()
+                                        .h(px(32.))
+                                        .px_3()
                                         .gap_3()
+                                        .rounded(px(6.))
+                                        .bg(cx.theme().secondary)
+                                        .border_1()
+                                        .border_color(cx.theme().secondary_hover)
+                                        .text_size(px(14.))
+                                        .font_medium()
+                                        .child(
+                                            Icon::new(IconName::FileText)
+                                                .small()
+                                                .text_color(cx.theme().muted_foreground),
+                                        )
                                         .child(div().flex_1().min_w_0().truncate().child(label))
                                         .child(
                                             div()
+                                                .flex_shrink_0()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded(px(4.))
+                                                .text_size(px(12.))
+                                                .bg(cx.theme().success.opacity(0.12))
                                                 .text_color(cx.theme().success)
                                                 .child(format!("+{}", file.additions())),
                                         )
                                         .child(
                                             div()
+                                                .flex_shrink_0()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded(px(4.))
+                                                .text_size(px(12.))
+                                                .bg(cx.theme().danger.opacity(0.12))
                                                 .text_color(cx.theme().danger)
                                                 .child(format!("−{}", file.deletions())),
                                         )
