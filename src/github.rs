@@ -1,11 +1,17 @@
 //! Read-only GitHub API access. Credentials stay inside the backend, never in saved state.
-use crate::repository::{self, GroupSnapshot};
+use crate::repository::{self, ChangedFile, Preview};
+use gpui_kit::{SharedString, component::diff::DiffFile};
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
     io::Read,
+    num::NonZeroUsize,
+    ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -116,7 +122,161 @@ pub struct Page {
 }
 pub struct PullDiff {
     pub pr: PullRequest,
-    pub snapshot: GroupSnapshot,
+    pub snapshot: PullSnapshot,
+}
+
+/// The immutable downloaded diff, indexed by file. Only headers are parsed for
+/// the listing; source documents are built on demand, without another request.
+pub struct PullSnapshot {
+    patch: String,
+    files: Vec<ChangedFile>,
+    ranges: HashMap<SharedString, Range<usize>>,
+}
+impl PullSnapshot {
+    pub fn parse(patch: String) -> Result<Self, String> {
+        if patch.len() > 16 * 1024 * 1024 {
+            return Err(too_large());
+        }
+        let starts: Vec<_> = patch
+            .match_indices("diff --git ")
+            .filter(|(ix, _)| *ix == 0 || patch.as_bytes()[ix - 1] == b'\n')
+            .map(|(ix, _)| ix)
+            .collect();
+        if starts.is_empty() && !patch.trim().is_empty() {
+            return Err("Couldn't read this PR: expected a Git diff.".into());
+        }
+        let mut files = Vec::with_capacity(starts.len());
+        let mut ranges = HashMap::with_capacity(starts.len());
+        for (ix, &start) in starts.iter().enumerate() {
+            let range = start..starts.get(ix + 1).copied().unwrap_or(patch.len());
+            let block = &patch[range.clone()];
+            let header = block
+                .split_once("\n@@ ")
+                .map_or(block, |(header, _)| header);
+            let mut parsed =
+                DiffFile::parse(header).map_err(|e| format!("Couldn't read this diff: {e}"))?;
+            if parsed.len() != 1 {
+                return Err("Couldn't read this PR's file header.".into());
+            }
+            let file = parsed.pop().unwrap();
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            block.hash(&mut hash);
+            files.push(ChangedFile::from_diff(&file, hash.finish()));
+            if ranges.insert(file.path().clone(), range).is_some() {
+                return Err("Couldn't read this PR: duplicate file path.".into());
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let snapshot = Self {
+            patch,
+            files,
+            ranges,
+        };
+        if snapshot.estimated_size_bytes() > SNAPSHOT_BUDGET {
+            return Err(too_large());
+        }
+        Ok(snapshot)
+    }
+    pub fn files(&self) -> &[ChangedFile] {
+        &self.files
+    }
+    pub fn load_preview(&self, entry: &ChangedFile) -> Result<Preview, String> {
+        let _span = tracing::info_span!("github_preview").entered();
+        let range = self
+            .ranges
+            .get(&entry.path)
+            .ok_or("PR file unavailable. Refresh to retry.")?;
+        let file = DiffFile::parse(&self.patch[range.clone()])
+            .map_err(|e| format!("Couldn't read this diff: {e}"))?
+            .into_iter()
+            .find(|file| file.path() == &entry.path)
+            .ok_or("PR file unavailable. Refresh to retry.")?;
+        let bytes = file.estimated_size_bytes();
+        if bytes > 32 * 1024 * 1024 {
+            return Err(too_large());
+        }
+        Ok(Preview {
+            file,
+            fingerprint: entry.revision,
+            bytes,
+        })
+    }
+    /// Prepare one bounded document for the continuous, virtualized PR viewer.
+    /// Runs on the background executor and never performs network or Git I/O.
+    pub fn load_document(&self) -> Result<Vec<Preview>, String> {
+        self.load_document_with_budget(32 * 1024 * 1024)
+    }
+    fn load_document_with_budget(&self, budget: usize) -> Result<Vec<Preview>, String> {
+        let mut bytes = 0;
+        let mut previews = Vec::with_capacity(self.files.len());
+        for entry in &self.files {
+            let preview = self.load_preview(entry)?;
+            bytes += preview.bytes;
+            if bytes > budget {
+                return Err(too_large());
+            }
+            previews.push(preview);
+        }
+        Ok(previews)
+    }
+    fn estimated_size_bytes(&self) -> usize {
+        self.patch.capacity()
+            + self.files.capacity() * std::mem::size_of::<ChangedFile>()
+            + self.ranges.capacity() * std::mem::size_of::<(SharedString, Range<usize>)>()
+            + self
+                .files
+                .iter()
+                .map(|f| f.path.len() + f.original.as_ref().map_or(0, |p| p.len()))
+                .sum::<usize>()
+    }
+}
+fn too_large() -> String {
+    "This PR is too large for the desktop preview. Open it in GitHub.".into()
+}
+
+const SNAPSHOT_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Separate from the parsed-preview LRU: evicting a source document must not
+/// discard the only local copy of the PR and cause a full network refetch.
+pub(crate) struct SnapshotCache {
+    entries: LruCache<PathBuf, Arc<PullSnapshot>>,
+    bytes: usize,
+    budget: usize,
+}
+impl Default for SnapshotCache {
+    fn default() -> Self {
+        Self::new(8, SNAPSHOT_BUDGET)
+    }
+}
+impl SnapshotCache {
+    fn new(capacity: usize, budget: usize) -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap()),
+            bytes: 0,
+            budget,
+        }
+    }
+    pub(crate) fn get(&mut self, root: &Path) -> Option<Arc<PullSnapshot>> {
+        self.entries.get(root).cloned()
+    }
+    pub(crate) fn insert(&mut self, root: PathBuf, snapshot: PullSnapshot) {
+        let bytes = snapshot.estimated_size_bytes();
+        if bytes > self.budget {
+            return;
+        }
+        if let Some(old) = self.entries.pop(&root) {
+            self.bytes -= old.estimated_size_bytes();
+        }
+        while self.bytes + bytes > self.budget || self.entries.len() == self.entries.cap().get() {
+            if let Some((_, old)) = self.entries.pop_lru() {
+                self.bytes -= old.estimated_size_bytes();
+            } else {
+                break;
+            }
+        }
+        self.bytes += bytes;
+        self.entries.put(root, Arc::new(snapshot));
+    }
 }
 pub trait Backend: Send + Sync {
     fn list(&self, repo: &Repository, page: u32) -> Result<Page, String>;
@@ -277,9 +437,7 @@ impl Backend for OctocrabBackend {
                 let pr = handler.get(number).await.map_err(error)?;
                 let patch = handler.get_diff(number).await.map_err(error)?;
                 if patch.len() > 16 * 1024 * 1024 {
-                    return Err(
-                        "This PR is too large for the desktop preview. Open it in GitHub.".into(),
-                    );
+                    return Err(too_large());
                 }
                 // Metadata and the diff are separate requests. Don't cache a newer patch
                 // under old commit IDs if a force-push or base update happened in between.
@@ -290,18 +448,7 @@ impl Backend for OctocrabBackend {
                             .into(),
                     );
                 }
-                let snapshot = GroupSnapshot::parse(patch)?;
-                if snapshot
-                    .files
-                    .iter()
-                    .map(|f| f.estimated_size_bytes())
-                    .sum::<usize>()
-                    > 32 * 1024 * 1024
-                {
-                    return Err(
-                        "This PR is too large for the desktop preview. Open it in GitHub.".into(),
-                    );
-                }
+                let snapshot = PullSnapshot::parse(patch)?;
                 Ok(PullDiff {
                     pr: pull(pr),
                     snapshot,
@@ -318,6 +465,145 @@ impl Backend for OctocrabBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn patch(path: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-before\n+after\n"
+        )
+    }
+
+    #[test]
+    fn indexed_previews_match_full_diff_in_path_order() {
+        let patch = concat!(
+            "diff --git a/z.txt b/z.txt\n--- a/z.txt\n+++ b/z.txt\n@@ -1 +1 @@\n-before\n+diff --git a/not-a-file b/not-a-file\n\\ No newline at end of file\n",
+            "diff --git a/old name.txt b/new name.txt\nsimilarity index 100%\nrename from old name.txt\nrename to new name.txt\n",
+            "diff --git a/empty.txt b/empty.txt\nnew file mode 100644\nindex 0000000..e69de29\n",
+            "diff --git a/deleted.txt b/deleted.txt\ndeleted file mode 100644\n--- a/deleted.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n",
+            "diff --git a/binary.dat b/binary.dat\nnew file mode 100644\nBinary files /dev/null and b/binary.dat differ\n",
+            "diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n",
+            "diff --git a/source.txt b/copy.txt\nsimilarity index 100%\ncopy from source.txt\ncopy to copy.txt\n",
+            "diff --git \"a/\\303\\251.txt\" \"b/\\303\\251.txt\"\n--- \"a/\\303\\251.txt\"\n+++ \"b/\\303\\251.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        for patch in [patch.to_owned(), patch.replace('\n', "\r\n")] {
+            let full = crate::repository::GroupSnapshot::parse(patch.clone()).unwrap();
+            let snapshot = PullSnapshot::parse(patch).unwrap();
+            assert_eq!(snapshot.files().len(), full.files.len());
+            for (entry, expected) in snapshot.files().iter().zip(full.files) {
+                assert_eq!(
+                    entry,
+                    &ChangedFile::from_diff(&expected, full.revisions[expected.path()])
+                );
+                let preview = snapshot.load_preview(entry).unwrap();
+                assert_eq!(preview.file.path(), expected.path());
+                assert_eq!(preview.file.status(), expected.status());
+                assert_eq!(preview.file.original_path(), expected.original_path());
+                assert_eq!(preview.file.modified_path(), expected.modified_path());
+                assert_eq!(preview.file.additions(), expected.additions());
+                assert_eq!(preview.file.deletions(), expected.deletions());
+                assert_eq!(preview.file.is_binary(), expected.is_binary());
+                assert_eq!(preview.fingerprint, entry.revision);
+            }
+        }
+    }
+
+    #[test]
+    fn previews_are_parsed_only_when_requested() {
+        let snapshot = PullSnapshot::parse(format!(
+            "{}diff --git a/bad.txt b/bad.txt\n--- a/bad.txt\n+++ b/bad.txt\n@@ invalid hunk\n",
+            patch("good.txt")
+        ))
+        .unwrap();
+        assert_eq!(snapshot.files().len(), 2);
+        assert!(snapshot.load_preview(&snapshot.files()[0]).is_err());
+        assert!(snapshot.load_preview(&snapshot.files()[1]).is_ok());
+        assert!(
+            PullSnapshot::parse(String::new())
+                .unwrap()
+                .files()
+                .is_empty()
+        );
+        assert!(PullSnapshot::parse("not a diff".into()).is_err());
+        assert!(PullSnapshot::parse("x".repeat(16 * 1024 * 1024 + 1)).is_err());
+        assert!(
+            PullSnapshot::parse(format!("{}{}", patch("same.txt"), patch("same.txt"))).is_err()
+        );
+    }
+
+    #[test]
+    fn continuous_document_keeps_path_order_and_bounds_total_memory() {
+        let snapshot =
+            PullSnapshot::parse(format!("{}{}", patch("z.txt"), patch("a.txt"))).unwrap();
+        let document = snapshot.load_document().unwrap();
+        assert_eq!(
+            document
+                .iter()
+                .map(|p| p.file.path().as_str())
+                .collect::<Vec<_>>(),
+            ["a.txt", "z.txt"]
+        );
+        let bytes = document.iter().map(|p| p.bytes).sum();
+        assert!(snapshot.load_document_with_budget(bytes).is_ok());
+        assert!(snapshot.load_document_with_budget(bytes - 1).is_err());
+        assert!(
+            PullSnapshot::parse(String::new())
+                .unwrap()
+                .load_document()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapshot_cache_is_bounded_by_slots_and_bytes() {
+        let snapshot = || PullSnapshot::parse(patch("file.txt")).unwrap();
+        let weight = snapshot().estimated_size_bytes();
+        let mut cache = SnapshotCache::new(2, weight * 2);
+        cache.insert("one".into(), snapshot());
+        cache.insert("two".into(), snapshot());
+        let retained = cache.get(Path::new("one")).unwrap();
+        cache.insert("three".into(), snapshot());
+        assert!(cache.get(Path::new("two")).is_none());
+        assert!(cache.get(Path::new("one")).is_some());
+        cache.insert("one".into(), snapshot());
+        assert_eq!(cache.bytes, weight * 2);
+        // A preview already parsing in the background survives LRU eviction.
+        cache.insert("four".into(), snapshot());
+        cache.insert("five".into(), snapshot());
+        assert!(cache.get(Path::new("one")).is_none());
+        assert!(retained.load_preview(&retained.files()[0]).is_ok());
+
+        let mut cache = SnapshotCache::new(8, weight);
+        cache.insert("one".into(), snapshot());
+        cache.insert("two".into(), snapshot());
+        assert!(cache.get(Path::new("one")).is_none());
+        assert!(cache.get(Path::new("two")).is_some());
+        assert_eq!(cache.bytes, weight);
+    }
+
+    #[test]
+    fn snapshot_namespaces_include_repository_and_both_commits() {
+        let repo = Repository::parse("https://github.com/owner/repo").unwrap();
+        let mut pr = PullRequest {
+            number: 1,
+            title: String::new(),
+            author: String::new(),
+            draft: false,
+            base: "main".into(),
+            head: "feature".into(),
+            base_sha: "base".into(),
+            head_sha: "head".into(),
+        };
+        let root = pr.cache_root(&repo);
+        pr.head_sha.push('2');
+        assert_ne!(root, pr.cache_root(&repo));
+        pr.head_sha.pop();
+        pr.base_sha.push('2');
+        assert_ne!(root, pr.cache_root(&repo));
+        pr.base_sha.pop();
+        let other = Repository::parse("https://github.com/owner/other").unwrap();
+        assert_ne!(root, pr.cache_root(&other));
+    }
+
     #[test]
     fn api_client_initializes_on_a_background_thread() {
         std::thread::spawn(|| {

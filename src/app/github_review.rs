@@ -1,9 +1,6 @@
 //! Repository-scoped remote review. Local checkout views and their watchers stay independent.
 use super::{Diffy, review::ReviewView};
-use crate::{
-    github::{self, Backend, PullRequest, Remote, Repository},
-    repository::{ChangeGroup, ChangedFile, Preview, PreviewKey},
-};
+use crate::github::{self, Backend, PullRequest, Remote, Repository};
 use gpui_kit::component::{
     Disableable as _, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -25,12 +22,14 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 pub(super) struct Runtime {
     pub states: HashMap<PathBuf, State>,
     pub backend: Arc<dyn Backend>,
+    snapshots: github::SnapshotCache,
 }
 impl Default for Runtime {
     fn default() -> Self {
         Self {
             states: HashMap::new(),
             backend: Arc::new(github::OctocrabBackend),
+            snapshots: github::SnapshotCache::default(),
         }
     }
 }
@@ -73,6 +72,7 @@ impl State {
             Some(ListRequest::Refresh) => Some("Refreshing pull requests…"),
             Some(ListRequest::More) => Some("Loading more…"),
             None if self.loading => Some("Loading diff…"),
+            None if self.view.preview_loading => Some("Loading preview…"),
             None => None,
         }
     }
@@ -90,6 +90,8 @@ impl State {
                 cx.notify();
             }
         });
+        let view = ReviewView::continuous(cx);
+        let diff_subscription = cx.observe(&view.diff, |_, _, cx| cx.notify());
         Self {
             remote_mode: false,
             remotes: Vec::new(),
@@ -103,7 +105,7 @@ impl State {
             loading: false,
             list_request: None,
             error: None,
-            view: ReviewView::new(cx),
+            view,
             cache_root: None,
             list_generation: 0,
             diff_generation: 0,
@@ -111,7 +113,7 @@ impl State {
             list_task: None,
             diff_task: None,
             menu_search,
-            subscriptions: vec![subscription],
+            subscriptions: vec![subscription, diff_subscription],
         }
     }
     pub(super) fn cancel(&mut self, cx: &mut Context<Diffy>) {
@@ -353,10 +355,14 @@ impl Diffy {
         let Some(repo) = s.repository.clone() else {
             return;
         };
-        if !s.prs.iter().any(|p| p.number == number) {
+        let Some(pr) = s.prs.iter().find(|p| p.number == number) else {
+            return;
+        };
+        let root = pr.cache_root(&repo);
+        let changed = s.selected != Some(number);
+        if !changed && !force && s.loading {
             return;
         }
-        let changed = s.selected != Some(number);
         if !changed && !force && s.cache_root.is_some() {
             self.ensure_pr_preview(cx);
             return;
@@ -366,10 +372,23 @@ impl Diffy {
             s.cache_root = None;
         }
         s.selected = Some(number);
-        s.loading = true;
         s.error = None;
         s.diff_generation += 1;
         let generation = s.diff_generation;
+        s.diff_task = None;
+        s.view.preview_generation += 1;
+        s.view.preview_task = None;
+        s.view.preview_loading = false;
+        if !force && let Some(snapshot) = self.github.snapshots.get(&root) {
+            s.loading = false;
+            s.cache_root = Some(root);
+            s.view
+                .install_metadata(snapshot.files().to_vec(), number, cx);
+            self.ensure_pr_preview(cx);
+            cx.notify();
+            return;
+        }
+        s.loading = true;
         let backend = self.github.backend.clone();
         s.diff_task = Some(cx.spawn(async move |owner, cx| {
             let request_repo = repo.clone();
@@ -398,56 +417,11 @@ impl Diffy {
                         if let Some(pr) = s.prs.iter_mut().find(|p| p.number == number) {
                             *pr = result.pr;
                         }
-                        // Pin the selected file even if the PR exceeds the cache's slot count.
-                        let preferred = s.view.selected.clone();
-                        let selected_preview = result
-                            .snapshot
-                            .files
-                            .iter()
-                            .find(|f| preferred.as_ref() == Some(f.path()))
-                            .or_else(|| result.snapshot.files.first())
-                            .map(|file| {
-                                let revision = result.snapshot.revisions[file.path()];
-                                (
-                                    Preview {
-                                        file: file.clone(),
-                                        fingerprint: revision,
-                                        bytes: file.estimated_size_bytes(),
-                                    },
-                                    revision,
-                                )
-                            });
-                        let mut cache =
-                            this.preview_cache.lock().unwrap_or_else(|e| e.into_inner());
-                        let entries = result
-                            .snapshot
-                            .files
-                            .into_iter()
-                            .map(|file| {
-                                let revision = result.snapshot.revisions[file.path()];
-                                let entry = ChangedFile::from_diff(&file, revision);
-                                cache.insert(
-                                    PreviewKey {
-                                        root: root.clone(),
-                                        group: ChangeGroup::Changes,
-                                        path: file.path().clone(),
-                                        revision,
-                                    },
-                                    Preview {
-                                        bytes: file.estimated_size_bytes(),
-                                        fingerprint: revision,
-                                        file,
-                                    },
-                                );
-                                entry
-                            })
-                            .collect();
-                        drop(cache);
+                        let entries = result.snapshot.files().to_vec();
+                        this.github.snapshots.insert(root.clone(), result.snapshot);
                         s.cache_root = Some(root);
                         s.view.install_metadata(entries, number, cx);
-                        if let Some((preview, revision)) = selected_preview {
-                            s.view.install_preview(preview, revision, cx);
-                        }
+                        this.ensure_pr_preview(cx);
                     }
                     Err(error) => s.error = Some(error),
                 }
@@ -463,7 +437,7 @@ impl Diffy {
         let Some(s) = self.github.states.get_mut(&key) else {
             return;
         };
-        if !s.remote_mode {
+        if !s.remote_mode || s.loading {
             return;
         }
         if s.cache_root.is_none()
@@ -474,31 +448,54 @@ impl Diffy {
             self.select_pr(number, true, cx);
             return;
         }
-        let Some(entry) = s.view.selected_entry().cloned() else {
-            return;
-        };
-        if s.view.preview_revision == Some(entry.revision) {
+        if s.view.files.is_empty() || s.view.document_ready() || s.view.preview_loading {
             return;
         }
-        if let Some(root) = s.cache_root.clone() {
-            let cached = self
-                .preview_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&PreviewKey {
-                    root,
-                    group: ChangeGroup::Changes,
-                    path: entry.path.clone(),
-                    revision: entry.revision,
-                });
-            if let Some(preview) = cached {
-                s.view.install_preview(preview, entry.revision, cx);
-            } else if !s.loading
+        let Some(root) = s.cache_root.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.github.snapshots.get(&root) else {
+            if s.error.is_none()
                 && let Some(number) = s.selected
             {
                 self.select_pr(number, true, cx);
             }
-        }
+            return;
+        };
+        let view = &mut s.view;
+        view.preview_generation += 1;
+        let generation = view.preview_generation;
+        view.preview_loading = true;
+        view.preview_error = None;
+        self.preview_requests += 1;
+        view.preview_task = Some(cx.spawn(async move |owner, cx| {
+            let result = cx
+                .background_spawn(async move { snapshot.load_document() })
+                .await;
+            let _ = owner.update(cx, |this, cx| {
+                if this.github_key().as_ref() != Some(&key) {
+                    return;
+                }
+                let Some(s) = this.github.states.get_mut(&key) else {
+                    return;
+                };
+                let view = &mut s.view;
+                if !s.remote_mode
+                    || s.cache_root.as_ref() != Some(&root)
+                    || view.preview_generation != generation
+                {
+                    return;
+                }
+                view.preview_loading = false;
+                view.preview_task = None;
+                match result {
+                    Ok(document) => view.install_document(document, cx),
+                    Err(error) => view.preview_error = Some(error),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
     fn change_remote(&mut self, repo: Repository, cx: &mut Context<Self>) {
         let Some(key) = self.github_key() else {
@@ -714,7 +711,7 @@ impl Diffy {
         if let Some(p) = self.projects.get(self.active) {
             let id = p.id;
             if let Some(file) = p.view().selected_entry().cloned() {
-                self.stage_path(id, ChangeGroup::Changes, &file.path, cx);
+                self.stage_path(id, crate::repository::ChangeGroup::Changes, &file.path, cx);
                 self.load(Some((vec![file], true)), cx);
             }
         }
@@ -723,6 +720,29 @@ impl Diffy {
         self.pr_state().and_then(|s| s.selected)
     }
     pub fn github_busy(&self) -> bool {
-        self.pr_state().is_some_and(|s| s.listing || s.loading)
+        self.pr_state()
+            .is_some_and(|s| s.listing || s.loading || s.view.preview_loading)
+    }
+    pub fn github_document_paths(&self, cx: &gpui_kit::App) -> Vec<gpui_kit::SharedString> {
+        self.pr_state()
+            .map(|s| {
+                s.view
+                    .diff
+                    .read(cx)
+                    .files()
+                    .iter()
+                    .map(|f| f.path().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub fn github_reading_file(&self, cx: &gpui_kit::App) -> Option<gpui_kit::SharedString> {
+        self.pr_state()?
+            .view
+            .diff
+            .read(cx)
+            .reading_position()
+            .source_line()
+            .map(|line| line.path().clone())
     }
 }

@@ -299,7 +299,7 @@ impl Diffy {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )
-            .child(
+            .children((!remote).then(|| {
                 h_flex()
                     .id("preview-header")
                     .test_support()
@@ -383,8 +383,8 @@ impl Diffy {
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.stage_file(cx))),
                         )
-                    }),
-            )
+                    })
+            }))
             .children(
                 (if remote {
                     self.pr_state().and_then(|s| s.error.as_ref())
@@ -506,7 +506,41 @@ impl Diffy {
                             .absolute()
                             .size_full()
                             .border_0()
-                            .header_visible(false)
+                            .header_visible(remote)
+                            .when(remote, |diff| {
+                                let id = p.id;
+                                diff.render_header(move |file, _, cx| {
+                                    let path = file.path().clone();
+                                    let label = match (file.original_path(), file.modified_path()) {
+                                        (Some(old), Some(new)) if old != new => {
+                                            format!("{old} → {new}")
+                                        }
+                                        _ => path.to_string(),
+                                    };
+                                    h_flex()
+                                        .id(gpui_kit::SharedString::from(format!(
+                                            "pr-file-header:{path}"
+                                        )))
+                                        .test_support()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_3()
+                                        .child(div().flex_1().min_w_0().truncate().child(label))
+                                        .child(
+                                            div()
+                                                .text_color(cx.theme().success)
+                                                .child(format!("+{}", file.additions())),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(cx.theme().danger)
+                                                .child(format!("−{}", file.deletions())),
+                                        )
+                                        .context_menu(move |menu, _, _| {
+                                            super::reader::file_menu(menu, id, path.as_str(), false)
+                                        })
+                                })
+                            })
                             .soft_wrap(self.reader.wrap)
                             .split_ratio(0.4)
                             .hunk_separator(DiffHunkSeparator::Simple),

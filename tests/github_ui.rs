@@ -2,12 +2,11 @@
 mod fixture;
 use diffy::{
     app,
-    github::{Backend, Page, PullDiff, PullRequest, Remote, Repository},
-    repository::GroupSnapshot,
+    github::{Backend, Page, PullDiff, PullRequest, PullSnapshot, Remote, Repository},
 };
 use gpui_kit::{
-    AppContext as _, Bounds, HeadlessAppContext, WindowBounds, WindowOptions, assets::Assets, px,
-    size, test::TestWindowExt as _,
+    AppContext as _, Bounds, HeadlessAppContext, ScrollDelta, WindowBounds, WindowOptions,
+    assets::Assets, point, px, size, test::TestWindowExt as _,
 };
 use std::{
     sync::{
@@ -86,7 +85,7 @@ impl Backend for FakeGitHub {
         }
         Ok(PullDiff {
             pr: pr(number, rev),
-            snapshot: GroupSnapshot::parse(patch)?,
+            snapshot: PullSnapshot::parse(patch)?,
         })
     }
 }
@@ -202,6 +201,18 @@ fn main() {
             "Repeated refresh clicks must not duplicate the initial list request"
         );
         assert!(w.try_find("pr-loading-status").is_none());
+        assert!(w.try_find("preview-header").is_none());
+        assert!(w.try_find("pr-file-header:src/review.rs").is_some());
+        assert!(w.try_find("pr-file-header:z.txt").is_some());
+        assert_eq!(view.read(cx).github_document_paths(cx).len(), 2);
+        let parses = view.read(cx).preview_request_count();
+        w.click(("file-name", 1usize), cx);
+        w.render_frame(cx);
+        assert_eq!(view.read(cx).selected_file().unwrap().as_ref(), "z.txt");
+        assert_eq!(view.read(cx).github_document_paths(cx).len(), 2);
+        w.click(("file-name", 0usize), cx);
+        w.render_frame(cx);
+        assert_eq!(view.read(cx).preview_request_count(), parses);
         assert_eq!(
             view.read(cx).selected_file().unwrap().as_ref(),
             "src/review.rs"
@@ -248,10 +259,34 @@ fn main() {
     })
     .unwrap();
     wait!();
+    let calls = backend.calls.load(Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("source-prs", cx);
+        w.render_frame(cx);
+        w.dispatch_action(Box::new(app::PreviousWorktree), cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(view.read(cx).github_selected(), Some(1));
+        w.dispatch_action(Box::new(app::NextWorktree), cx);
+    })
+    .unwrap();
+    wait!();
+    assert_eq!(
+        backend.calls.load(Ordering::Relaxed),
+        calls,
+        "Returning to a visited PR should reuse its commit-keyed snapshot"
+    );
     cx.update_window(handle, |_, w, cx| {
         assert_eq!(view.read(cx).github_selected(), Some(2));
         w.click("source-worktrees", cx);
         w.render_frame(cx);
+        assert!(
+            view.read(cx).github_document_paths(cx).is_empty(),
+            "Inactive PR source documents must be released"
+        );
         assert_eq!(view.read(cx).selected_file().cloned(), local_selected);
         assert!(w.try_find("stage-all").is_some());
         // Editing a local file while PR mode is active must not replace the PR snapshot.
@@ -315,6 +350,7 @@ fn main() {
     })
     .unwrap();
     wait!();
+    let calls = backend.calls.load(Ordering::Relaxed);
     backend.revision.store(1, Ordering::Relaxed);
     cx.update_window(handle, |_, w, cx| {
         w.click("refresh", cx);
@@ -334,6 +370,11 @@ fn main() {
     })
     .unwrap();
     wait!();
+    assert_eq!(
+        backend.calls.load(Ordering::Relaxed),
+        calls + 1,
+        "Explicit refresh must fetch a fresh snapshot even when the PR is cached"
+    );
     cx.update_window(handle, |_, w, cx| {
         assert_eq!(view.read(cx).github_selected(), Some(3));
         w.render_frame(cx);
@@ -341,13 +382,27 @@ fn main() {
     .unwrap();
     // Start a delayed response, then leave PR mode before it completes.
     backend.delayed.store(true, Ordering::Relaxed);
+    let calls = backend.calls.load(Ordering::Relaxed);
     cx.update_window(handle, |_, w, cx| {
         w.dispatch_action(Box::new(app::NextWorktree), cx);
         w.dispatch_action(Box::new(app::NextWorktree), cx);
-        w.render_frame(cx);
     })
     .unwrap();
-    cx.run_until_parked();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        assert_eq!(view.read(cx).github_selected(), Some(2));
+        w.render_frame(cx);
+        w.click("refresh", cx);
+    })
+    .unwrap();
+    for _ in 0..500 {
+        cx.run_until_parked();
+        if backend.calls.load(Ordering::Relaxed) > calls {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(backend.calls.load(Ordering::Relaxed), calls + 1);
     cx.update_window(handle, |_, w, cx| {
         w.click("source-worktrees", cx);
         w.render_frame(cx);
@@ -365,6 +420,10 @@ fn main() {
         backend.fail.store(true, Ordering::Relaxed);
         w.click("source-prs", cx);
         w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
         w.click("refresh", cx);
         w.render_frame(cx);
     })
@@ -383,8 +442,8 @@ fn main() {
     })
     .unwrap();
     wait!();
-    // Remote changes clear the old PR; a large PR must keep the selected preview
-    // even when inserting its other files evicts it from the shared cache.
+    // Remote changes clear the old PR. A PR exceeding the parsed-preview LRU's
+    // capacity must remain fully browsable without another GitHub request.
     cx.update_window(handle, |_, w, cx| {
         w.click("pr-overflow", cx);
         w.render_frame(cx);
@@ -409,6 +468,102 @@ fn main() {
     })
     .unwrap();
     wait!();
+    let calls = backend.calls.load(Ordering::Relaxed);
+    let parses = cx.update(|cx| view.read(cx).preview_request_count());
+    backend.fail.store(true, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(view.read(cx).github_document_paths(cx).len(), 42);
+        assert!(w.try_find("pr-file-header:extra-00.txt").is_some());
+        assert!(w.try_find("pr-file-header:extra-01.txt").is_some());
+        w.press("escape", cx);
+        w.scroll(
+            "diff-body",
+            ScrollDelta::Pixels(point(px(0.), px(-900.))),
+            cx,
+        );
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    let reading_file = cx.update(|cx| view.read(cx).github_reading_file(cx).unwrap());
+    assert_ne!(
+        reading_file.as_ref(),
+        "extra-00.txt",
+        "Wheel scrolling must cross file boundaries"
+    );
+    cx.update_window(handle, |_, w, cx| {
+        w.click("split", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        assert_eq!(
+            view.read(cx).github_reading_file(cx).as_ref(),
+            Some(&reading_file)
+        );
+        w.click("source-worktrees", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update_window(handle, |_, w, cx| {
+        assert!(view.read(cx).github_document_paths(cx).is_empty());
+        w.click("source-prs", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    let parses = cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).github_reading_file(cx).as_ref(),
+            Some(&reading_file)
+        );
+        assert_eq!(view.read(cx).preview_request_count(), parses + 1);
+        view.read(cx).preview_request_count()
+    });
+    // Unmeasured header heights are estimates. Continue the wheel gesture as
+    // virtualized rows settle, rather than assuming one jump measures the tail.
+    for _ in 0..4 {
+        cx.update_window(handle, |_, w, cx| {
+            w.scroll(
+                "diff-body",
+                ScrollDelta::Pixels(point(px(0.), px(-100000.))),
+                cx,
+            );
+            w.render_frame(cx);
+        })
+        .unwrap();
+        wait!();
+        if cx
+            .update_window(handle, |_, w, _| {
+                w.try_find("pr-file-header:z.txt").is_some()
+            })
+            .unwrap()
+        {
+            break;
+        }
+    }
+    cx.update_window(handle, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("pr-file-header:z.txt").is_some(),
+            "One scrollbar must reach the final PR file"
+        );
+        w.scroll(
+            "diff-body",
+            ScrollDelta::Pixels(point(px(0.), px(100000.))),
+            cx,
+        );
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("target/previews/diffy-github-continuous.png")
+        .unwrap();
     cx.update_window(handle, |_, w, cx| {
         w.render_frame(cx);
         assert_eq!(
@@ -420,7 +575,6 @@ fn main() {
     })
     .unwrap();
     wait!();
-    let calls = backend.calls.load(Ordering::Relaxed);
     for _ in 0..8 {
         cx.run_until_parked();
         cx.update_window(handle, |_, w, cx| {
@@ -435,8 +589,86 @@ fn main() {
     assert_eq!(
         backend.calls.load(Ordering::Relaxed),
         calls,
-        "Evicted previews must not create a refetch loop"
+        "Selecting an uncached file must not refetch the PR"
     );
+    for direction in [1, -1] {
+        let steps = if direction == 1 { 40 } else { 41 };
+        for _ in 0..steps {
+            cx.update_window(handle, |_, w, cx| {
+                w.dispatch_action(
+                    if direction == 1 {
+                        Box::new(app::NextFile)
+                    } else {
+                        Box::new(app::PreviousFile)
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+            wait!();
+            cx.update(|cx| {
+                let v = view.read(cx);
+                assert_eq!(v.selected_preview_path(), v.selected_file());
+                assert!(v.selected_preview_path().is_some());
+            });
+        }
+    }
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).selected_preview_path().unwrap().as_ref(),
+            "extra-00.txt"
+        );
+    });
+    // Repeated file jumps must retain the same document, not reset or reparse it.
+    cx.update_window(handle, |_, w, cx| {
+        for _ in 0..35 {
+            w.dispatch_action(Box::new(app::NextFile), cx);
+        }
+        for _ in 0..35 {
+            w.dispatch_action(Box::new(app::PreviousFile), cx);
+        }
+    })
+    .unwrap();
+    wait!();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).selected_preview_path().unwrap().as_ref(),
+            "extra-00.txt"
+        );
+    });
+    assert_eq!(
+        backend.calls.load(Ordering::Relaxed),
+        calls,
+        "Traversing all 42 files and revisiting evicted previews must work offline"
+    );
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).preview_request_count(),
+            parses,
+            "Scrolling and tree navigation must not rebuild the PR document"
+        );
+        assert_eq!(view.read(cx).github_document_paths(cx).len(), 42);
+    });
+    backend.fail.store(false, Ordering::Relaxed);
+    backend.revision.store(2, Ordering::Relaxed);
+    cx.update_window(handle, |_, w, cx| {
+        w.click("refresh", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    wait!();
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).preview_request_count(),
+            parses + 1,
+            "Refreshing a changed, unselected file must replace the whole scrolling document"
+        );
+        assert_eq!(view.read(cx).github_document_paths(cx).len(), 42);
+        assert_eq!(
+            view.read(cx).selected_file().unwrap().as_ref(),
+            "extra-00.txt"
+        );
+    });
     assert_eq!(std::fs::read(repo.0.join(".git/index")).unwrap(), index);
     println!(
         "GitHub PR header, search, pagination, read-only actions, local restoration, stale responses, and retry passed."

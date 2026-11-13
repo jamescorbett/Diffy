@@ -17,7 +17,10 @@ fn main() -> Result<(), String> {
         .or_else(|| page.items.first().map(|p| p.number));
     if let Some(number) = number {
         let diff = OctocrabBackend.diff(&repo, number)?;
-        println!("GitHub diff succeeded: {} files", diff.snapshot.files.len());
+        println!(
+            "GitHub diff succeeded: {} files",
+            diff.snapshot.files().len()
+        );
     }
     Ok(())
 }

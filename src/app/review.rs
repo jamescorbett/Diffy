@@ -87,6 +87,12 @@ pub(super) struct ReviewView {
     pub(super) preview_error: Option<String>,
     pub(super) preview_generation: u64,
     pub(super) preview_task: Option<gpui_kit::Task<()>>,
+    /// PRs retain one bounded, virtualized document; local views stay single-file.
+    continuous: bool,
+    document: Vec<Preview>,
+    /// May be false while the previous document is still visible during refresh.
+    document_ready: bool,
+    document_jump: bool,
     reading_position: Option<gpui_kit::component::diff::DiffReadingPosition>,
     demos: HashMap<SharedString, Preview>,
     pub(super) rows: Arc<Vec<FileRow>>,
@@ -119,6 +125,10 @@ impl ReviewView {
             preview_error: None,
             preview_generation: 0,
             preview_task: None,
+            continuous: false,
+            document: Vec::new(),
+            document_ready: false,
+            document_jump: false,
             reading_position: None,
             demos: HashMap::new(),
             rows: Arc::default(),
@@ -140,6 +150,50 @@ impl ReviewView {
             row_sizes: Rc::default(),
             focus: cx.focus_handle(),
         }
+    }
+
+    pub(super) fn continuous(cx: &mut Context<Diffy>) -> Self {
+        Self {
+            continuous: true,
+            ..Self::new(cx)
+        }
+    }
+
+    pub(super) fn document_ready(&self) -> bool {
+        self.document_ready
+    }
+
+    pub(super) fn install_document(&mut self, document: Vec<Preview>, cx: &mut Context<Diffy>) {
+        let preserve = !self.document.is_empty() && !self.document_jump;
+        let position = self.reading_position.take();
+        let files = document.iter().map(|p| p.file.clone()).collect::<Vec<_>>();
+        self.diff.update(cx, |diff, cx| {
+            if preserve {
+                diff.set_files_preserving_position(files, cx);
+            } else {
+                diff.set_files(files, cx);
+            }
+            if let Some(position) = position {
+                diff.restore_reading_position(position, cx);
+            } else if !preserve && let Some(path) = &self.selected {
+                diff.scroll_to_file(path, cx);
+            }
+        });
+        self.document = document;
+        self.document_ready = true;
+        self.document_jump = false;
+        self.update_document_preview();
+        self.preview_loading = false;
+        self.preview_error = None;
+    }
+
+    fn update_document_preview(&mut self) {
+        self.preview = self
+            .document
+            .iter()
+            .find(|p| self.selected.as_ref() == Some(p.file.path()))
+            .cloned();
+        self.preview_revision = self.preview.as_ref().map(|p| p.fingerprint);
     }
 
     pub(super) fn clear(&mut self, cx: &mut Context<Diffy>) {
@@ -165,11 +219,25 @@ impl ReviewView {
             .map(|p| &p.file)
     }
     pub(super) fn select(&mut self, path: SharedString, cx: &mut Context<Diffy>) {
-        if self.selected.as_ref() == Some(&path) {
+        if !self.continuous && self.selected.as_ref() == Some(&path) {
             return;
         }
         self.selected = Some(path);
-        self.reset_selection(cx);
+        if self.continuous {
+            self.reading_position = None;
+            self.document_jump = !self.document_ready;
+            self.update_document_preview();
+            if self.document_ready
+                && let Some(path) = &self.selected
+            {
+                self.diff.update(cx, |diff, cx| {
+                    diff.set_file_collapsed(path, false, cx);
+                    diff.scroll_to_file(path, cx);
+                });
+            }
+        } else {
+            self.reset_selection(cx);
+        }
         if let Some(ix) = self
             .selected
             .as_ref()
@@ -180,6 +248,9 @@ impl ReviewView {
         }
     }
     fn reset_selection(&mut self, cx: &mut Context<Diffy>) {
+        self.document.clear();
+        self.document_ready = false;
+        self.document_jump = false;
         self.reading_position = None;
         self.preview_generation += 1;
         self.preview_task = None;
@@ -241,6 +312,9 @@ impl ReviewView {
             self.preview_revision = None;
             self.diff.update(cx, |diff, cx| diff.set_files(None, cx));
         }
+        self.document.clear();
+        self.document_ready = false;
+        self.document_jump = false;
     }
 
     pub(super) fn set_query(&mut self, query: String, cx: &mut Context<Diffy>) {
@@ -348,6 +422,7 @@ impl ReviewView {
     ) {
         let previous_selected = self.selected.clone();
         let previous_revision = self.selected_entry().map(|e| e.revision);
+        let document_changed = self.continuous && *self.files != files;
         let ordinal = self
             .selected
             .as_ref()
@@ -386,7 +461,9 @@ impl ReviewView {
             });
         if self.selected != previous_selected || !self.demos.is_empty() {
             self.reset_selection(cx);
-        } else if self.selected_entry().map(|e| e.revision) != previous_revision {
+        } else if self.selected_entry().map(|e| e.revision) != previous_revision || document_changed
+        {
+            self.document_ready = false;
             self.preview_generation += 1;
             self.preview_task = None;
             self.preview_loading = false;
